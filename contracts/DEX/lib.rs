@@ -10,10 +10,10 @@ mod DEX {
     /// to add new static storage fields to your contract.
     #[ink(storage)]
     pub struct DEX {
-        //reserves
+        whale_addresses: StorageHashMap<OtherAccountId, (u64, Balance)>,
         token_addresses: StorageHashMap<u64, OtherAccountId>,
-        liquidity_pools: StorageHashMap<(u64, u64), (Balance, Balance)>,
-        token_total_balance: StorageHashMap<u64, Balance>,
+        liquidity_pools: StorageHashMap<(u64, u64), (Balance, Balance)>, //pairs and their balances
+        token_total_balance: StorageHashMap<u64, Balance>, //some token's total balance in the contract
     }
 
     #[ink(event)]
@@ -41,6 +41,8 @@ mod DEX {
         NoPoolFound,
         ZeroAmount,
         SameTokensNotAllowed,
+        LiquidityRatioProblem,
+        ReduceTheFunds,
     }
 
     pub type Result<T> = core::result::Result<T, Error>;
@@ -51,10 +53,13 @@ mod DEX {
             let liquidity_pools = StorageHashMap::default();
             let token_total_balance = StorageHashMap::default();
             let token_addresses = StorageHashMap::default();
+
+            let whale_addresses = StorageHashMap::default();
             Self {
                 liquidity_pools,
                 token_total_balance,
                 token_addresses,
+                whale_addresses,
             }
         }
 
@@ -74,15 +79,10 @@ mod DEX {
             Ok(self.liquidity_pools.get((id_a, id_b)).unwrap())
             //return error when the balances of any are zero or if the ids are same
         }
-        #[ink(message)]
-        pub fn get_all_tokens(&self) {
-            // let keys_vec: Vec<&u64> = self.token_total_balance.;
-        }
-
-        #[ink(message)]
-        pub fn get_all_pools(&self) {
-            //all keys of the liquidity_pools
-        }
+        // #[ink(message)]
+        // pub fn get_all_tokens(&self) {
+        //     // let keys_vec: Vec<&u64> = self.token_total_balance;
+        // }
 
         #[ink(message, payable)]
         pub fn add_liquidity(
@@ -92,10 +92,6 @@ mod DEX {
             amount_a: Balance,
             amount_b: Balance,
         ) -> Result<()> {
-            //deduct the tokens from user to the token addresses and
-            // then call a transfer function to send those token to this contract's address
-            //update the balance of the user as well as this contract
-
             //also check for the fact if token is not there in the DEX
             //return errors if ids are same or the amounts are 0
             if id_a == id_b {
@@ -103,13 +99,18 @@ mod DEX {
             } else if amount_a == 0 || amount_b == 0 {
                 return Err(Error::ZeroAmount);
             }
+            //liquidity ratio must be maintained  0.5:1while adding
+            if 2 * amount_a == amount_b {
+                return Err(Error::LiquidityRatioProblem);
+            }
+
             //get the tokenAddress
             let account_a = self.token_addresses.get(&id_a).unwrap();
             let account_b = self.token_addresses.get(&id_b).unwrap();
             //get the provider and transfer its tokens to the generated addresses
             let provider = self.env().caller();
-            self.env().transfer(account_a, amount_a).unwrap(); //but amount a must be token a how to implement that
-            self.env().transfer(account_b, amount_b).unwrap();
+            let result_a = self.env().transfer(account_a, amount_a).unwrap(); //but amount a must be token a how to implement that
+            let result_b = self.env().transfer(account_b, amount_b).unwrap();
             //also add that the amounts are added by provider in the erc20 contract
 
             //edit the mapping value first of the token info
@@ -126,6 +127,9 @@ mod DEX {
             pool.0 += amount_a;
             pool.1 += amount_b;
             self.liquidity_pools.insert((id_a, id_b), &pool);
+            //edit the balances of the ehale providers
+            self.whale_addresses.insert(&provider, &(id_a, amount_a));
+            self.whale_addresses.insert(&provider, &(id_b, amount_b));
             //emit the event
             self.env().emit_event(LiquidityAdded {
                 provider,
@@ -139,8 +143,15 @@ mod DEX {
 
         #[ink(message)]
         pub fn get_output_amt(&self, token_in: u64, token_out: u64, amount_in: Balance) -> Balance {
-            //the swapping logic
-            return 2;
+            let (balance_in, balance_out) =
+                self.liquidity_pools.get((&token_in, &token_out)).unwrap();
+            //if after the swap ratio is 0.2:1
+            let balance_final = (balance_in * balance_out) / (balance_in + &amount_in);
+            if balance_final >= 5 * (balance_in + &amount_in) {
+                return balance_final;
+            }
+
+            return 0;
         }
 
         #[ink(message, payable)]
@@ -152,9 +163,17 @@ mod DEX {
         ) -> Result<()> {
             let caller = self.env().caller();
             //get the real amount
-            let amount_out = self.get_output_amt(token_in, token_out, amount_in);
+            let amount_final = self.get_output_amt(token_in, token_out, amount_in);
             //write the token transfer logic from the caller's account
-            //take the amount in thiss contract and update the balancemapping in the erc20 
+            if amount_final == 0 {
+                return Err(Error::ReduceTheFunds);
+            }
+            let (.., balance_out) = self.liquidity_pools.get((&token_in, &token_out)).unwrap();
+            let amount_out = balance_out - amount_final;
+            self.env().transfer(caller, amount_out).unwrap();
+
+            //take the amount in thiss contract and update the balancemapping in the erc20
+            //figure out about how to charge fees
             //emit the event
             self.env().emit_event(TokensSwapped {
                 caller,
